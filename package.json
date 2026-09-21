@@ -1,17 +1,25 @@
 {
   "name": "pi-jev-skill-picker",
   "version": "0.1.0",
-  "description": "Keeps Pi's full Agent Skills catalog out of every model request and ranks skills for the current task with TypeSafe's Jev (System One) instead of a subagent fork.",
+  "description": "Keeps Pi's full Agent Skills catalog out of every model request and ranks skills for the current task with Jev — classifier.dev by default, TypeSafe's System One when a key is set — instead of a subagent fork. Runs under Pi and omp.",
   "keywords": [
     "pi",
     "pi-extension",
+    "omp",
+    "oh-my-pi",
+    "extension",
     "skills",
     "typesafe",
+    "classifier.dev",
     "jev",
     "system-one"
   ],
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rezhajulio/pi-jev-skill-picker.git"
+  },
   "files": [
     "extensions",
     "README.md",
@@ -26,6 +34,11 @@
     "node": ">=22.6"
   },
   "pi": {
+    "extensions": [
+      "extensions/skill-jev.ts"
+    ]
+  },
+  "omp": {
     "extensions": [
       "extensions/skill-jev.ts"
     ]
