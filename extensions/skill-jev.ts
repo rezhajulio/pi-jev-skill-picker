@@ -72,8 +72,8 @@ function xmlAttribute(value: string): string {
 		.replaceAll(">", "&gt;");
 }
 
-function renderSkill(skill: SkillEntry, note: string): string {
-	const body = stripFrontmatter(readFileSync(skill.filePath, "utf8"));
+function renderSkill(skill: SkillEntry, note: string, content = readFileSync(skill.filePath, "utf8")): string {
+	const body = stripFrontmatter(content);
 	return [
 		`<skill name="${xmlAttribute(skill.name)}" location="${xmlAttribute(skill.filePath)}">`,
 		note,
@@ -257,30 +257,54 @@ export default function (pi: ExtensionAPI) {
 			const limit = params.maxSkills ?? config.maxSkills;
 
 			const task = params.task.trim();
+			const unreadableSkills: { name: string; filePath: string; error: string }[] = [];
+			const readSkill = (skill: SkillEntry): string | undefined => {
+				try {
+					return readFileSync(skill.filePath, "utf8");
+				} catch (error) {
+					unreadableSkills.push({
+						name: skill.name,
+						filePath: skill.filePath,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return undefined;
+				}
+			};
+			const searchableSkills = skills.filter((skill) => readSkill(skill) !== undefined);
+			const unreadableNote = () => unreadableSkills.length
+				? "\n\nCould not read these enabled skills:\n"
+					+ unreadableSkills.map(({ name, filePath, error }) => `- ${name} (${filePath}): ${error}`).join("\n")
+				: "";
+			if (!searchableSkills.length) {
+				return {
+					content: [{ type: "text", text: `No readable enabled Agent Skills are available to search.${unreadableNote()} Continue with ordinary tools and reasoning.` }],
+					details: { task, totalSkills: 0, inputTokens: 0, unreadableSkills },
+				};
+			}
 
 			onUpdate?.({
-				content: [{ type: "text", text: `Rating ${skills.length} enabled skills against the task…` }],
-				details: { status: "running", transport: config.transport, totalSkills: skills.length },
+				content: [{ type: "text", text: `Rating ${searchableSkills.length} enabled skills against the task…` }],
+				details: { status: "running", transport: config.transport, totalSkills: searchableSkills.length },
 			});
 
 			let result: Awaited<ReturnType<typeof rankSkills>>;
 			try {
-				result = await rankSkills(task, skills, config, limit, signal);
+				result = await rankSkills(task, searchableSkills, config, limit, signal);
 			} catch (error) {
 				if (signal?.aborted) throw error;
 				if (!(error instanceof JevError)) throw error;
 
-				const matches = lexicalMatches(skills, task, limit);
+				const matches = lexicalMatches(searchableSkills, task, limit);
 				const reason = `Jev was unreachable (${error.message})`;
 				if (!matches.length) {
 					return {
 						content: [
 							{
 								type: "text",
-								text: `${reason}. The deterministic lexical fallback matched no skills either. Continue with ordinary tools and reasoning.`,
+								text: `${reason}. The deterministic lexical fallback matched no skills either.${unreadableNote()} Continue with ordinary tools and reasoning.`,
 							},
 						],
-						details: { task, fallback: "lexical", error: error.message, matches: [] },
+						details: { task, fallback: "lexical", error: error.message, matches: [], unreadableSkills },
 					};
 				}
 
@@ -292,7 +316,7 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text:
-								`${reason}, so these are lexical keyword matches rather than Jev judgments. Read a SKILL.md before following it.\n\n${rendered}`,
+								`${reason}, so these are lexical keyword matches rather than Jev judgments. Read a SKILL.md before following it.\n\n${rendered}${unreadableNote()}`,
 						},
 					],
 					details: {
@@ -300,6 +324,7 @@ export default function (pi: ExtensionAPI) {
 						fallback: "lexical",
 						error: error.message,
 						matches: matches.map(({ skill, score }) => ({ name: skill.name, filePath: skill.filePath, score })),
+						unreadableSkills,
 					},
 				};
 			}
@@ -310,12 +335,13 @@ export default function (pi: ExtensionAPI) {
 				transport: config.transport,
 				transports: result.transports,
 				fallbacks: result.fallbacks,
-				totalSkills: skills.length,
+				totalSkills: searchableSkills.length,
 				shards: result.shards,
 				inputTokens: result.inputTokens,
 				classifications: result.classifications,
 				minScore: config.minScore,
 				partialFailures: result.failures,
+				unreadableSkills,
 				selections: result.ranked.map(({ skill, score, confidence }) => ({
 					name: skill.name,
 					filePath: skill.filePath,
@@ -337,16 +363,20 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `No enabled Agent Skill scored at or above ${config.minScore} of 2 for this task.${partial}${diverted} Continue with ordinary tools and reasoning.`,
+							text: `No enabled Agent Skill scored at or above ${config.minScore} of 2 for this task.${partial}${diverted}${unreadableNote()} Continue with ordinary tools and reasoning.`,
 						},
 					],
 					details,
 				};
 			}
 
-			const loaded = result.ranked.map(({ skill, score, confidence }) =>
-				renderSkill(skill, `Jev rated this ${score.toFixed(2)} of 2 for the stated task (confidence ${confidence.toFixed(2)}).`),
-			);
+			const loaded: string[] = [];
+			for (const { skill, score, confidence } of result.ranked) {
+				const content = readSkill(skill);
+				if (content !== undefined) {
+					loaded.push(renderSkill(skill, `Jev rated this ${score.toFixed(2)} of 2 for the stated task (confidence ${confidence.toFixed(2)}).`, content));
+				}
+			}
 			// Everything else above the floor, so the agent can pull one in deliberately.
 			const alsoText = result.alsoRanked.length
 				? `\n\nThese also scored above ${config.minScore} but were not loaded. Use skill_load to pull one in:\n`
@@ -359,8 +389,9 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "text",
 						text:
-							`Jev selected and loaded ${loaded.length} Agent Skill${loaded.length === 1 ? "" : "s"} out of ${skills.length} enabled.${partial}${diverted} Follow these instructions for the current task:\n\n`
-							+ loaded.join("\n\n") + alsoText,
+							`Jev selected ${result.ranked.length} and loaded ${loaded.length} Agent Skill${loaded.length === 1 ? "" : "s"} out of ${searchableSkills.length} enabled.${partial}${diverted} `
+							+ (loaded.length ? "Follow these instructions for the current task:\n\n" : "None of the selected skills could be read. Continue with ordinary tools and reasoning.")
+							+ loaded.join("\n\n") + alsoText + unreadableNote(),
 					},
 				],
 				details,

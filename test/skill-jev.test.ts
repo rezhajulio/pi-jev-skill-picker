@@ -262,3 +262,144 @@ test("a name that matches nothing returns close alternatives instead of failing"
 function hiddenSkillEntry() {
 	return { name: "secret", description: "Internal only", filePath: hidden.path, baseDir: hidden.baseDir };
 }
+
+const missingSkill = { name: "missing", description: "Deleted from disk", filePath: join(root, "missing", "SKILL.md"), baseDir: join(root, "missing") };
+const unreadableDir = join(root, "unreadable-dir");
+mkdirSync(unreadableDir, { recursive: true });
+const dirSkill = { name: "unreadable-dir", description: "A directory, not a file", filePath: unreadableDir, baseDir: unreadableDir };
+
+test("skill_search excludes missing and unreadable files before ranking", async () => {
+	await isolated(async () => {
+		const h = harness();
+		skillJev(h.pi);
+		await h.run("before_agent_start", { systemPrompt: "You are Pi.", systemPromptOptions: { skills: [missingSkill, dirSkill, fleetSkill] } });
+
+		const sent: string[] = [];
+		const restore = stubFetch((_url, init) => {
+			const body = JSON.parse(String(init.body)) as { inputs: string[] };
+			sent.push(...body.inputs);
+			return classifierReply(body.inputs, { unrelated: 0, adjacent: 0, applicable: 1 });
+		});
+		try {
+			const search = await h.tool("skill_search").execute("call", { task: "restart jellyfin over ssh" }, undefined, undefined, { cwd: root });
+			assert.equal(sent.length, 1, "only the readable skill is sent for ranking");
+			assert.ok(sent[0]!.startsWith("fleet:"));
+			assert.equal(search.details?.totalSkills, 1);
+			assert.equal((search.details?.unreadableSkills as { name: string }[] | undefined)?.length, 2);
+			const text = search.content[0]!.text;
+			assert.ok(text.includes("FLEET body."), "the readable winner still loads");
+			assert.ok(text.includes("missing") && text.includes("unreadable-dir"), "the file errors are reported");
+		} finally {
+			restore();
+		}
+	});
+});
+
+test("skill_search makes no request when no skill files are readable", async () => {
+	await isolated(async () => {
+		const h = harness();
+		skillJev(h.pi);
+		await h.run("before_agent_start", { systemPrompt: "You are Pi.", systemPromptOptions: { skills: [missingSkill] } });
+
+		let calls = 0;
+		const restore = stubFetch((_url, init) => {
+			calls++;
+			const body = JSON.parse(String(init.body)) as { inputs: string[] };
+			return classifierReply(body.inputs, { unrelated: 0, adjacent: 0, applicable: 1 });
+		});
+		try {
+			const search = await h.tool("skill_search").execute("call", { task: "restart jellyfin over ssh" }, undefined, undefined, { cwd: root });
+			assert.equal(calls, 0);
+			assert.ok(search.content[0]!.text.includes("No readable enabled Agent Skills are available to search."));
+			assert.ok(search.content[0]!.text.includes("missing"));
+			assert.equal(search.details?.totalSkills, 0);
+		} finally {
+			restore();
+		}
+	});
+});
+
+test("skill_search preserves the ranking when a selected skill disappears before loading", async () => {
+	await isolated(async () => {
+		const gone = writeSkill("vanished", "Here then gone");
+		const goneSkill = { name: "vanished", description: "Here then gone", filePath: gone.path, baseDir: gone.baseDir };
+		const h = harness();
+		skillJev(h.pi);
+		await h.run("before_agent_start", { systemPrompt: "You are Pi.", systemPromptOptions: { skills: [goneSkill, fleetSkill] } });
+
+		const restore = stubFetch((_url, init) => {
+			const body = JSON.parse(String(init.body)) as { inputs: string[] };
+			rmSync(gone.path, { force: true });
+			return classifierReply(body.inputs, { unrelated: 0, adjacent: 0, applicable: 1 });
+		});
+		try {
+			const search = await h.tool("skill_search").execute("call", { task: "restart jellyfin over ssh" }, undefined, undefined, { cwd: root });
+			const details = search.details as {
+				classifications?: number;
+				selections?: { name: string }[];
+				unreadableSkills?: { name: string; error: string }[];
+			};
+			assert.equal(details.classifications, 2, "usage survives the vanished file");
+			assert.deepEqual(details.selections?.map((entry) => entry.name), ["fleet", "vanished"]);
+			assert.equal(details.unreadableSkills?.[0]?.name, "vanished");
+			assert.match(details.unreadableSkills?.[0]?.error ?? "", /ENOENT/);
+			const text = search.content[0]!.text;
+			assert.ok(text.includes("FLEET body."), "the surviving winner still loads");
+			assert.ok(text.includes("vanished"));
+			assert.match(text, /loaded 1 Agent Skill/);
+		} finally {
+			restore();
+		}
+	});
+});
+
+test("skill_search says so when every selected skill disappears before loading", async () => {
+	await isolated(async () => {
+		const gone = writeSkill("gone", "Here then gone");
+		const goneSkill = { name: "gone", description: "Here then gone", filePath: gone.path, baseDir: gone.baseDir };
+		const h = harness();
+		skillJev(h.pi);
+		await h.run("before_agent_start", { systemPrompt: "You are Pi.", systemPromptOptions: { skills: [goneSkill] } });
+
+		const restore = stubFetch((_url, init) => {
+			const body = JSON.parse(String(init.body)) as { inputs: string[] };
+			rmSync(gone.path, { force: true });
+			return classifierReply(body.inputs, { unrelated: 0, adjacent: 0, applicable: 1 });
+		});
+		try {
+			const search = await h.tool("skill_search").execute("call", { task: "restart jellyfin over ssh" }, undefined, undefined, { cwd: root });
+			const text = search.content[0]!.text;
+			assert.ok(text.includes("None of the selected skills could be read."));
+			assert.ok(text.includes("gone"));
+		} finally {
+			restore();
+		}
+	});
+});
+
+test("skill_search keeps the lexical fallback during the credit cooldown", async () => {
+	await isolated(async () => {
+		const h = harness();
+		skillJev(h.pi);
+		await h.run("before_agent_start", { systemPrompt: "You are Pi.", systemPromptOptions: { skills: [fleetSkill, qbSkill] } });
+
+		let calls = 0;
+		const restore = stubFetch(() => {
+			calls++;
+			return new Response("no credits", { status: 402 });
+		});
+		try {
+			for (let i = 0; i < 2; i++) {
+				const search = await h.tool("skill_search").execute("call", { task: "fleet remote commands" }, undefined, undefined, { cwd: root });
+				assert.equal(search.details?.fallback, "lexical");
+				const text = search.content[0]!.text;
+				assert.ok(text.includes("lexical keyword matches"));
+				assert.ok(text.includes("fleet"));
+				assert.ok(text.includes("402"));
+			}
+			assert.equal(calls, 1, "the second search must not dispatch during the cooldown");
+		} finally {
+			restore();
+		}
+	});
+});

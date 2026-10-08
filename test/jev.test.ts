@@ -10,6 +10,7 @@ import {
 	CLASSIFIER_ENDPOINT,
 	loadConfig,
 	MAX_RETRY_DELAY_MS,
+	postJson,
 	questionId,
 	rank,
 	rankClassifierResults,
@@ -695,6 +696,78 @@ test("rankSkills without an API key fails before any request", async () => {
 		/No TypeSafe API key/,
 	);
 	assert.equal(called, false);
+});
+
+test("postJson does not resend a timed-out paid request", async () => {
+	const config = { ...typesafeConfig(), timeoutMs: 5 };
+	let calls = 0;
+	const fakeFetch = (async (_url: string, init: RequestInit) => {
+		if (++calls === 1) throw init.signal!.reason;
+		return new Response("{}");
+	}) as unknown as typeof fetch;
+	const realTimeout = AbortSignal.timeout;
+	AbortSignal.timeout = () => AbortSignal.abort(new DOMException("The operation timed out.", "TimeoutError"));
+	try {
+		await assert.rejects(
+			() => postJson("https://timeout.test", {}, { Authorization: "Bearer key" }, "TypeSafe", config, undefined, fakeFetch),
+			/timed out|timeout/i,
+		);
+		assert.equal(calls, 1);
+	} finally {
+		AbortSignal.timeout = realTimeout;
+	}
+});
+
+test("postJson still retries transient HTTP errors and connection resets", async () => {
+	const config = typesafeConfig();
+	for (const status of [429, 500, 502, 503, 529, undefined]) {
+		let calls = 0;
+		const fakeFetch = (async () => {
+			if (++calls === 1) {
+				if (status === undefined) throw new TypeError("ECONNRESET");
+				return new Response("try again", { status, headers: { "retry-after": "0" } });
+			}
+			return new Response("{}");
+		}) as unknown as typeof fetch;
+		await postJson(`https://retry-${status ?? "reset"}.test`, {}, { Authorization: "Bearer key" }, "TypeSafe", config, undefined, fakeFetch);
+		assert.equal(calls, 2, `retry ${status ?? "connection reset"}`);
+	}
+});
+
+test("postJson shares a short 402 cooldown only for the same endpoint and API key", async () => {
+	const config = typesafeConfig();
+	const key = (k: string) => ({ Authorization: `Bearer ${k}` });
+	let calls = 0;
+	let exhausted = true;
+	const fakeFetch = (async () => {
+		calls++;
+		return exhausted ? new Response("no credits", { status: 402 }) : new Response("{}");
+	}) as unknown as typeof fetch;
+	const realNow = Date.now;
+	let now = realNow();
+	Date.now = () => now;
+	try {
+		await assert.rejects(
+			() => postJson("https://credits.test", {}, key("key"), "TypeSafe", config, undefined, fakeFetch),
+			/402/,
+		);
+		await assert.rejects(
+			() => postJson("https://credits.test", {}, key("key"), "TypeSafe", config, undefined, fakeFetch),
+			/402/,
+		);
+		assert.equal(calls, 1, "a later caller must not dispatch during the cooldown");
+
+		exhausted = false;
+		await postJson("https://credits.test", {}, key("other-key"), "TypeSafe", config, undefined, fakeFetch);
+		await postJson("https://other.test", {}, key("key"), "TypeSafe", config, undefined, fakeFetch);
+		assert.equal(calls, 3, "other credentials and endpoints must remain usable");
+
+		now += 30_001;
+		await postJson("https://credits.test", {}, key("key"), "TypeSafe", config, undefined, fakeFetch);
+		assert.equal(calls, 4, "paid ranking must resume after the cooldown expires");
+	} finally {
+		Date.now = realNow;
+	}
 });
 
 test("rankSkills sends each request shape to its own service, never a mismatched endpoint", async () => {

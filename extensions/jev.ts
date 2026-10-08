@@ -20,7 +20,7 @@ export const TYPESAFE_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 export const DEFAULT_MODEL = "jev-latest";
 export const DEFAULT_SHARD_SIZE = 50;
 export const DEFAULT_MAX_SKILLS = 3;
-export const DEFAULT_MIN_SCORE = 1.4;
+export const DEFAULT_MIN_SCORE = 1.6;
 export const DEFAULT_DESCRIPTION_LIMIT = 1200;
 export const DEFAULT_TIMEOUT_MS = 20_000;
 export const DEFAULT_FALLBACK = true;
@@ -501,6 +501,8 @@ export class JevError extends Error {
 }
 
 const RETRYABLE = new Set([429, 500, 502, 503, 529]);
+const CREDIT_COOLDOWN_MS = 30_000;
+const creditCooldowns = new Map<string, { until: number; error: JevError }>();
 
 /** A 429 can name a wait of hours; a tool call cannot sit on one. */
 export const MAX_RETRY_DELAY_MS = 10_000;
@@ -529,8 +531,8 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
-/** One POST, with backoff on the documented retryable statuses. */
-async function postJson(
+/** One POST, with backoff on the documented retryable statuses. Exported for tests. */
+export async function postJson(
 	url: string,
 	body: Record<string, unknown>,
 	headers: Record<string, string>,
@@ -540,8 +542,14 @@ async function postJson(
 	fetchImpl: typeof fetch = fetch,
 	attempts = 3,
 ): Promise<unknown> {
+	// A 402 means the account behind this request is out of credits; remember it
+	// briefly so the other shards fail fast instead of sending futile requests.
+	const creditKey = JSON.stringify([url, headers["Authorization"] ?? ""]);
 	let lastError: JevError | undefined;
 	for (let attempt = 1; attempt <= attempts; attempt++) {
+		const cooldown = creditCooldowns.get(creditKey);
+		if (cooldown && cooldown.until > Date.now()) throw cooldown.error;
+		if (cooldown) creditCooldowns.delete(creditKey);
 		const timeout = AbortSignal.timeout(config.timeoutMs);
 		const composed = signal ? AbortSignal.any([signal, timeout]) : timeout;
 		let response: Response;
@@ -555,7 +563,8 @@ async function postJson(
 		} catch (error) {
 			if (signal?.aborted) throw new JevError("Skill ranking was cancelled.");
 			lastError = new JevError(`Request to ${url} failed: ${error instanceof Error ? error.message : String(error)}`);
-			if (attempt === attempts) break;
+			// A timeout may leave paid server-side work running; do not resend it.
+			if (timeout.aborted || attempt === attempts) break;
 			await sleep(retryDelayMs(undefined, attempt), signal);
 			continue;
 		}
@@ -571,6 +580,9 @@ async function postJson(
 
 		const detail = shorten(await response.text().catch(() => ""), 300);
 		lastError = new JevError(`${label} returned ${response.status}${detail ? `: ${detail}` : ""}`, response.status);
+		if (response.status === 402) {
+			creditCooldowns.set(creditKey, { until: Date.now() + CREDIT_COOLDOWN_MS, error: lastError });
+		}
 		if (!RETRYABLE.has(response.status) || attempt === attempts) break;
 		const retryAfter = Number.parseFloat(response.headers.get("retry-after") ?? "");
 		await sleep(retryDelayMs(Number.isFinite(retryAfter) ? retryAfter : undefined, attempt), signal);
